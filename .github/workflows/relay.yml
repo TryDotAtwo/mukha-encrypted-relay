@@ -1,0 +1,76 @@
+name: Encrypted rendezvous relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        required: true
+        type: string
+      fingerprint:
+        required: true
+        type: string
+      nonce:
+        required: true
+        type: string
+      challenge:
+        required: true
+        type: string
+      envelope:
+        required: true
+        type: string
+      expires:
+        required: true
+        type: string
+
+permissions: {}
+jobs:
+  relay:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install rendezvous client
+        run: python3 -m pip install --disable-pip-version-check magic-wormhole==0.24.0
+      - name: Relay encrypted messages
+        env:
+          SLOT: ${{ inputs.slot }}
+          FINGERPRINT: ${{ inputs.fingerprint }}
+          NONCE: ${{ inputs.nonce }}
+          CHALLENGE: ${{ inputs.challenge }}
+          ENVELOPE: ${{ inputs.envelope }}
+          EXPIRES: ${{ inputs.expires }}
+        run: |
+          python3 - <<'PY'
+          import base64, hmac, os, re, time
+          from twisted.internet.defer import ensureDeferred
+          from twisted.internet.task import react
+          from wormhole import create
+          from wormhole.cli.public_relay import RENDEZVOUS_RELAY
+
+          def decode(name):
+              return base64.b64decode(os.environ[name], validate=True)
+
+          async def relay(reactor):
+              slot, fingerprint = os.environ['SLOT'], os.environ['FINGERPRINT']
+              if not re.fullmatch(r'[0-9]{9}', slot) or not re.fullmatch(r'[0-9a-f]{64}', fingerprint):
+                  raise ValueError('Invalid rendezvous')
+              if not 0 < int(os.environ['EXPIRES']) - time.time() <= 605:
+                  raise ValueError('Expired rendezvous')
+              nonce, challenge, envelope = decode('NONCE'), decode('CHALLENGE'), decode('ENVELOPE')
+              if len(nonce) != 32 or len(challenge) != 384 or len(envelope) != 384:
+                  raise ValueError('Invalid encrypted payload')
+              channel = create('huggingface.co/TryDotAtwo/mukha-hige-order/v2', RENDEZVOUS_RELAY, reactor)
+              channel.set_code(slot + '-' + fingerprint)
+              channel.send_message(challenge)
+              if not hmac.compare_digest(await channel.get_message().addTimeout(90, reactor), nonce):
+                  raise ValueError('Worker did not prove key possession')
+              if time.time() >= int(os.environ['EXPIRES']):
+                  raise ValueError('Expired before envelope delivery')
+              channel.send_message(envelope)
+              if await channel.get_message().addTimeout(60, reactor) != ('received:' + fingerprint).encode():
+                  raise ValueError('Worker did not acknowledge envelope')
+              await channel.close().addTimeout(20, reactor)
+              print('Encrypted handoff acknowledged', flush=True)
+
+          react(lambda reactor: ensureDeferred(relay(reactor)))
+          PY
